@@ -5,6 +5,7 @@ M5 Debug: Run a single task with FY detailed diagnostics.
 
 import sys
 import json
+import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -42,11 +43,17 @@ def load_single_task(data_dir: Path, task_id: str):
 
 
 def main():
+    parser = argparse.ArgumentParser(description='M5 Debug: Single task with FY diagnostics')
+    parser.add_argument('--escalate_policy', type=str, default=None, choices=['E8', '2WL'],
+                       help='Escalation policy for Φ refinement')
+    args = parser.parse_args()
+
     task_id = "025d127b"
     data_dir = Path("data")
 
+    escalate_str = f" with escalate_policy={args.escalate_policy}" if args.escalate_policy else ""
     print("=" * 70)
-    print(f"M5 DEBUG: Task {task_id} with detailed FY diagnostics")
+    print(f"M5 DEBUG: Task {task_id} with detailed FY diagnostics{escalate_str}")
     print("=" * 70)
     print()
 
@@ -60,7 +67,7 @@ def main():
     result = solve_task(
         trains,
         tests,
-        escalate_policy=None,
+        escalate_policy=args.escalate_policy,
         use_task_color_canon=False,
         lut_density_tau=0.8
     )

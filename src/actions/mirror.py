@@ -21,28 +21,46 @@ CONTRACT = {
 
 def mirror_h(grid: Grid, mask: Mask) -> Grid:
     """
-    Mirror horizontally (left-right flip) within mask.
+    Mirror horizontally (left-right flip) within mask using per-row bbox.
 
-    For each masked row, reflects columns within the mask's bbox.
+    For each row, finds left[r] and right[r] over masked cells.
+    For each masked (r,c), computes c' = left[r] + right[r] - c.
+    Writes grid[r][c] to result[r][c'] if (r,c') is also masked.
+    Vacated masked cells become 0.
     """
     validate_colors(grid)
     h, w = dims(grid)
 
     result = deepcopy_grid(grid)
-    r_min, r_max, c_min, c_max = get_mask_bbox(mask)
 
-    if r_max < r_min:  # Empty mask
-        return result
+    # Process each row independently
+    for r in range(h):
+        # Find per-row mask bbox (left and right extent of masked cells in this row)
+        left_r = None
+        right_r = None
+        for c in range(w):
+            if mask[r][c]:
+                if left_r is None:
+                    left_r = c
+                right_r = c
 
-    # For each row, flip columns within bbox (only swap each pair once)
-    for r in range(r_min, r_max + 1):
-        # Only iterate up to midpoint to avoid double-swapping
-        mid_c = (c_min + c_max) // 2
-        for c in range(c_min, mid_c + 1):
-            mirror_c = c_min + (c_max - c)
-            if c != mirror_c:  # Don't swap with self
-                if mask[r][c] and mask[r][mirror_c]:
-                    result[r][c], result[r][mirror_c] = result[r][mirror_c], result[r][c]
+        # Skip rows with no masked cells
+        if left_r is None:
+            continue
+
+        # First, set all masked cells in this row to 0 (default/vacated state)
+        for c in range(w):
+            if mask[r][c]:
+                result[r][c] = 0
+
+        # Then, for each masked cell, write its value to the mirror position if possible
+        for c in range(w):
+            if mask[r][c]:
+                c_prime = left_r + right_r - c
+                if 0 <= c_prime < w and mask[r][c_prime]:
+                    # Write grid[r][c]'s value to result[r][c_prime]
+                    result[r][c_prime] = grid[r][c]
+                # else: drop (result[r][c] stays 0 from earlier initialization)
 
     return result
 

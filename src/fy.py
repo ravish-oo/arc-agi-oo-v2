@@ -251,22 +251,23 @@ def check_gate_a_totality(
     class_id: int,
     Xp_grids: List[Grid],
     labels_list: List[List[int]],
-    aux_list: List[AuxData]
+    aux_list: List[AuxData],
+    Yp_grids: Optional[List[Grid]] = None
 ) -> bool:
     """
-    Gate A: Totality on mask.
+    Gate A: Totality/Coverage.
 
-    For every pair and every pixel where M_k[p] is True,
-    the action must define a value.
+    For non-LUT actions: always True (they produce full grids).
+    For LUT: must cover 100% of EVIDENCE pixels (where Xp != Yp) on training.
 
-    For LUT: must cover 100% of masked pixels on training.
+    Clean pixels (where Xp == Yp) don't need keys - they'll be left unchanged.
     """
     # For non-LUT actions, we assume they always define values
     # (mirrors, shifts, sorts, constructors, set_color all produce full grids)
     if rule.action not in ["lut_r2", "lut_r3"]:
         return True
 
-    # For LUT: check coverage
+    # For LUT: check coverage on evidence pixels only
     lut = rule.params.get("lut", {})
     if not lut:
         return False
@@ -275,6 +276,7 @@ def check_gate_a_totality(
 
     for pair_idx in range(len(Xp_grids)):
         Xp = Xp_grids[pair_idx]
+        Yp = Yp_grids[pair_idx] if Yp_grids else Xp  # Fallback if not provided
         labels = labels_list[pair_idx]
         h, w = dims(Xp)
 
@@ -283,11 +285,15 @@ def check_gate_a_totality(
             continue
         mask = masks[class_id]
 
-        # Check every masked pixel has a LUT key
+        # Check every EVIDENCE pixel (where Xp != Yp) has a LUT key
         for row in range(h):
             for col in range(w):
                 if not mask[row][col]:
                     continue
+
+                # Only check evidence pixels (pixels that need to change)
+                if Xp[row][col] == Yp[row][col]:
+                    continue  # Clean pixel - no key needed
 
                 # Extract patch
                 patch = []
@@ -304,7 +310,7 @@ def check_gate_a_totality(
 
                 key = local_ofa(patch)
                 if key not in lut:
-                    return False  # Missing key - totality violated
+                    return False  # Missing key for evidence pixel
 
     return True
 
@@ -472,8 +478,27 @@ def check_gate_d_lut_regularity(
     r = {"lut_r2": 2, "lut_r3": 3}[rule.action]
     m = len(Xp_grids)
 
+    # Count total evidence pixels for this class across all pairs
+    total_evidence = 0
+    for pair_idx in range(m):
+        Xp = Xp_grids[pair_idx]
+        Yp = Yp_grids[pair_idx]
+        labels = labels_list[pair_idx]
+        h, w = dims(Xp)
+
+        masks = class_masks(labels, h, w)
+        if class_id not in masks:
+            continue
+        mask = masks[class_id]
+
+        for r_pos in range(h):
+            for c_pos in range(w):
+                if mask[r_pos][c_pos] and Xp[r_pos][c_pos] != Yp[r_pos][c_pos]:
+                    total_evidence += 1
+
     # Check key repetition (m >= 2)
-    if m >= 2:
+    # Relax for classes with < 2 evidence pixels (nothing to repeat!)
+    if m >= 2 and total_evidence >= 2:
         key_pair_counts = defaultdict(set)  # key -> set of pair indices
 
         for pair_idx in range(m):
@@ -641,90 +666,27 @@ def print_class_diagnostics(class_id, evidence, Xp_grids, Yp_grids, labels_list,
 
     m = len(Xp_grids)
 
-    # Try mirrors
+    # Try mirrors - use actual FY gate functions for accurate diagnostics
     for mirror_kind, mirror_name in [("h", "mirror_h"), ("v", "mirror_v"), ("diag", "mirror_diag")]:
-        # Check totality (Gate A)
-        masks_flat = []
-        for mask in masks:
-            for row in mask:
-                masks_flat.extend(row)
-        totality_ok = all(masks_flat)
+        rule = Rule(action=mirror_name, params={})
 
-        # Check safety (Gate B) - would this break non-evidence pixels?
-        safety_ok = True
-        for i, (Xp, Yp) in enumerate(zip(Xp_grids, Yp_grids)):
-            mask = masks[i]
-            if mirror_kind == "h":
-                edited = mirror_h(Xp, mask)
-            elif mirror_kind == "v":
-                edited = mirror_v(Xp, mask)
-            else:
-                edited = mirror_diag(Xp, mask)
-
-            # Check non-evidence pixels
-            h, w = dims(Xp)
-            for r in range(h):
-                for c in range(w):
-                    if mask[r][c] and (i, r, c) not in [(pi, pr, pc) for pi, pr, pc in evidence]:
-                        # Non-evidence pixel in mask
-                        if Xp[r][c] == Yp[r][c]:  # Should remain unchanged
-                            if edited[r][c] != Yp[r][c]:
-                                safety_ok = False
-                                break
-                if not safety_ok:
-                    break
-            if not safety_ok:
-                break
-
-        # Check LOO (Gate C) if m >= 2
-        loo_ok = True
-        if m >= 2:
-            for leave_out in range(m):
-                # Try learning on all pairs except leave_out
-                train_pairs = [(Xp_grids[i], Yp_grids[i]) for i in range(m) if i != leave_out]
-                # For mirrors, just check if it matches the test pair
-                test_Xp = Xp_grids[leave_out]
-                test_Yp = Yp_grids[leave_out]
-                test_mask = masks[leave_out]
-
-                if mirror_kind == "h":
-                    test_edited = mirror_h(test_Xp, test_mask)
-                elif mirror_kind == "v":
-                    test_edited = mirror_v(test_Xp, test_mask)
-                else:
-                    test_edited = mirror_diag(test_Xp, test_mask)
-
-                # Check if evidence matches
-                for r, c in evidence_by_pair[leave_out]:
-                    if test_edited[r][c] != test_Yp[r][c]:
-                        loo_ok = False
-                        break
-                if not loo_ok:
-                    break
+        # Use actual gate functions from FY
+        totality_ok = check_gate_a_totality(rule, class_id, Xp_grids, labels_list, aux_list, Yp_grids)
+        safety_ok = check_gate_b_non_evidence_safety(rule, class_id, Xp_grids, Yp_grids, labels_list, aux_list)
+        loo_ok = check_gate_c_leave_one_out(rule, class_id, Xp_grids, Yp_grids, labels_list, aux_list)
 
         result = "PASS" if (totality_ok and safety_ok and loo_ok) else "FAIL"
         print(f"  - {mirror_name}: totality={totality_ok}, safety={safety_ok}, loo={loo_ok} -> {result}")
 
-    # Try shifts
+    # Try shifts - use actual FY gate functions
     print(f"  - shift: (trying dr,dc in [-2,2])")
     shift_found = False
     for dr in range(-2, 3):
         for dc in range(-2, 3):
             if dr == 0 and dc == 0:
                 continue
-            # Quick check if this shift works
-            works = True
-            for i, (Xp, Yp) in enumerate(zip(Xp_grids, Yp_grids)):
-                mask = masks[i]
-                edited = shift(Xp, mask, dr, dc)
-                # Check evidence
-                for r, c in evidence_by_pair[i]:
-                    if edited[r][c] != Yp[r][c]:
-                        works = False
-                        break
-                if not works:
-                    break
-            if works:
+            rule = Rule(action="shift", params={"dr": dr, "dc": dc})
+            if passes_all_gates(rule, class_id, Xp_grids, Yp_grids, labels_list, aux_list, lut_density_tau):
                 print(f"    shift({dr},{dc}): PASS")
                 shift_found = True
                 break
@@ -733,41 +695,22 @@ def print_class_diagnostics(class_id, evidence, Xp_grids, Yp_grids, labels_list,
     if not shift_found:
         print(f"    no shift found: FAIL")
 
-    # Try LUT
+    # Try LUT - use actual FY functions
     for r in [2, 3]:
-        # Build LUT from evidence
-        lut = {}
-        collisions = 0
-        for i, (Xp, Yp) in enumerate(zip(Xp_grids, Yp_grids)):
-            mask = masks[i]
-            labels = labels_list[i]
-            h, w = dims(Xp)
-
-            for r_pos in range(h):
-                for c_pos in range(w):
-                    if not mask[r_pos][c_pos]:
-                        continue
-
-                    # Extract r×r patch
-                    if r_pos + r > h or c_pos + r > w:
-                        continue
-
-                    patch = tuple(tuple(Xp[r_pos+dr][c_pos+dc] for dc in range(r)) for dr in range(r))
-                    target = Yp[r_pos][c_pos]
-
-                    if patch in lut:
-                        if lut[patch] != target:
-                            collisions += 1
-                    else:
-                        lut[patch] = target
-
-        repetition_ok = len([1 for patch in lut.keys() if sum(1 for i in range(len(Xp_grids)) for r_pos in range(len(Xp_grids[i])) for c_pos in range(len(Xp_grids[i][0])) if masks[i][r_pos][c_pos] and r_pos+r<=len(Xp_grids[i]) and c_pos+r<=len(Xp_grids[i][0]) and tuple(tuple(Xp_grids[i][r_pos+dr][c_pos+dc] for dc in range(r)) for dr in range(r)) == patch) >= 2]) >= 2
-
-        coverage_changed = sum(1 for i in range(len(Xp_grids)) for r_pos, c_pos in evidence_by_pair[i])
-        density = len(lut) / coverage_changed if coverage_changed > 0 else 0
-
-        result = "PASS" if (collisions == 0 and repetition_ok and density <= lut_density_tau) else "FAIL"
-        print(f"  - lut_r{r}: |lut|={len(lut)}, collisions={collisions}, repetition_ok={repetition_ok}, density={density:.2f} -> {result}")
+        lut = build_lut_from_evidence(evidence, Xp_grids, Yp_grids, labels_list, class_id, r)
+        if lut is not None:
+            action_name = f"lut_r{r}"
+            rule = Rule(action=action_name, params={"lut": lut})
+            passes = passes_all_gates(rule, class_id, Xp_grids, Yp_grids, labels_list, aux_list, lut_density_tau)
+            result = "PASS" if passes else "FAIL"
+            # Calculate diagnostics for display (using actual gate logic)
+            gate_a = check_gate_a_totality(rule, class_id, Xp_grids, labels_list, aux_list, Yp_grids)
+            gate_b = check_gate_b_non_evidence_safety(rule, class_id, Xp_grids, Yp_grids, labels_list, aux_list)
+            gate_c = check_gate_c_leave_one_out(rule, class_id, Xp_grids, Yp_grids, labels_list, aux_list)
+            gate_d = check_gate_d_lut_regularity(rule, class_id, Xp_grids, Yp_grids, labels_list, lut_density_tau)
+            print(f"  - lut_r{r}: |lut|={len(lut)}, gate_a={gate_a}, gate_b={gate_b}, gate_c={gate_c}, gate_d={gate_d} -> {result}")
+        else:
+            print(f"  - lut_r{r}: build failed (no LUT) -> FAIL")
 
     print(f"===\n")
 
@@ -1009,6 +952,10 @@ def learn_for_one_theta(
             if escalate_policy and not escalated:
                 escalated = True
 
+                # Get mask size before escalation
+                masks_before = class_masks(labels_list[0], *dims(Xp_grids[0]))
+                mask_size_before = sum(sum(1 for cell in row if cell) for row in masks_before.get(class_id, [])) if class_id in masks_before else 0
+
                 # Recompute Φ with escalation for ALL pairs
                 labels_list_esc = []
                 for Xp, _ in trains_transformed:
@@ -1035,6 +982,21 @@ def learn_for_one_theta(
                     idx = len(aux_list_esc)
                     row_blocks, col_blocks = mk_rowcol_blocks(labels_list_esc[idx], h, w)
                     aux_list_esc.append(AuxData(row_blocks=row_blocks, col_blocks=col_blocks))
+
+                # Get mask size after escalation
+                masks_after = class_masks(labels_list_esc[0], *dims(Xp_grids[0]))
+                # The failing class might have split - find which new class(es) contain the old evidence
+                mask_size_after = 0
+                for new_class_id, new_evidence in evidence_sets_esc.items():
+                    # Check if any old evidence is in this new class
+                    old_evidence_set = set(evidence_sets[class_id])
+                    new_evidence_set = set(new_evidence)
+                    if old_evidence_set & new_evidence_set:  # Intersection
+                        mask_size_after += sum(sum(1 for cell in row if cell) for row in masks_after.get(new_class_id, []))
+
+                # Log escalation
+                if FY_DEBUG_LOG:
+                    print(f"\nESCALATION: policy={escalate_policy}, class={class_id}, mask_size_before={mask_size_before}, mask_size_after={mask_size_after}\n")
 
                 # Retry learning with escalated Φ
                 return learn_for_one_theta_after_escalation(
@@ -1270,8 +1232,8 @@ def passes_all_gates(
     if not check_gate_d_lut_regularity(rule, class_id, Xp_grids, Yp_grids, labels_list, lut_density_tau):
         return False
 
-    # Gate A: Totality (moderate - checks all masked pixels have keys)
-    if not check_gate_a_totality(rule, class_id, Xp_grids, labels_list, aux_list):
+    # Gate A: Totality (moderate - checks all evidence pixels have keys)
+    if not check_gate_a_totality(rule, class_id, Xp_grids, labels_list, aux_list, Yp_grids):
         return False
 
     # Gate C: Leave-one-out (most expensive - rebuilds LUT m times)
