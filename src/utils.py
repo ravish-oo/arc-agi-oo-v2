@@ -49,3 +49,16 @@ def deepcopy_grid(grid: Grid) -> Grid:
     Create a deep copy of a grid.
     """
     return [row[:] for row in grid]
+
+
+def validate_colors(grid: Grid) -> None:
+    """
+    Validate that all colors in grid are in range 0-9.
+    Raises ValueError if any color is out of range.
+    """
+    h, w = dims(grid)
+    for r in range(h):
+        for c in range(w):
+            color = grid[r][c]
+            if not (0 <= color <= 9):
+                raise ValueError(f"Invalid color {color} at ({r},{c}); must be 0-9")

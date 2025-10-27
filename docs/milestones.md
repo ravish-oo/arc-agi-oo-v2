@@ -30,7 +30,7 @@
 
 **Exit when:** both checks 100% on training.
 
-## M2 — P (feasibility only)
+## M2 — P (feasibility only) ✅ COMPLETE
 
 **Implement:** `enumerate_feasible_P(trains_pi)`
 Include: identity, H/V/180, 90/270 if square, transpose when needed, scale up {2,3}, pool {2,3} with aggregators {majority, first_nonzero, center}, tiling via exact divisors, block perm/subst on exact k×k partitions (color-neutral).
@@ -43,7 +43,7 @@ Include: identity, H/V/180, 90/270 if square, transpose when needed, scale up {2
 
 **Exit when:** all pairs have ≥1 feasible θ.
 
-## M3 — Φ (input-only 1-WL)
+## M3 — Φ (input-only 1-WL) ✅ COMPLETE
 
 **Implement:** build relations (C_k, E4, R_row, R_col, R_cc,k; optional bands/phases only if detected). Run 1-WL to fixed point. Choose **one** escalation path (either 2-WL or +E8) and hardcode it.
 
