@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.pi_orient import canon_orient
 from src.p_menu import enumerate_feasible_P
-from src.fy import learn_rules_via_wl_and_actions, glue_once, class_masks, build_row_col_blocks, AuxData
+from src.fy import learn_rules_via_wl_and_actions, glue_once, class_masks, mk_rowcol_blocks, AuxData
 from src.phi_rel import build_rel_structure
 from src.phi_wl import wl_refine
 from src.p_menu import apply_theta
@@ -180,7 +180,7 @@ def main():
 
                 # Build aux
                 h, w = dims(Xp)
-                row_blocks, col_blocks = build_row_col_blocks(labels, h, w)
+                row_blocks, col_blocks = mk_rowcol_blocks(labels, h, w)
                 aux = AuxData(row_blocks=row_blocks, col_blocks=col_blocks)
 
                 # Glue

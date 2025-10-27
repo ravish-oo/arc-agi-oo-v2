@@ -1,0 +1,16 @@
+============================================================
+M5b VERIFICATION: Learning Driver
+============================================================
+
+Loading up to 20 suitable training tasks...
+Loaded 20 tasks
+
+============================================================
+PROCESSING TASKS
+============================================================
+✗ Task 00576224: UNSAT
+  Reason: all_thetas_failed
+✗ Task 025d127b: UNSAT
+  Reason: all_thetas_failed
+✗ Task 03560426: UNSAT
+  Reason: all_thetas_failed
