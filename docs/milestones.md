@@ -20,7 +20,7 @@
 
 # Milestones (tight, minimal)
 
-## M1 — Π only
+## M1 — Π only ✅ COMPLETE
 
 **Implement:** `canon_orient(Z) -> (Zc, undo)` using fixed order over D8 (+ transpose when shapes differ).
 **Verifier (training-only):**
