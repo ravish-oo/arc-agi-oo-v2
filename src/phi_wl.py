@@ -9,6 +9,9 @@ from typing import List, Dict, Tuple, Optional
 from collections import Counter
 from src.phi_rel import RelStructure, RelationTag
 
+# Global counter to track Φ calls (for M6 "No Φ after GLUE" verification)
+PHI_CALL_COUNTER = 0
+
 
 def wl_refine(rel: RelStructure,
               max_iters: int = 20,
@@ -37,6 +40,9 @@ def wl_refine(rel: RelStructure,
 
     Deterministic; no randomness; no absolute coordinates in labels.
     """
+    global PHI_CALL_COUNTER
+    PHI_CALL_COUNTER += 1
+
     n = rel.n
 
     if n == 0:

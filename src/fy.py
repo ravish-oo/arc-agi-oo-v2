@@ -51,6 +51,7 @@ class LearnResult(NamedTuple):
     theta: Optional[object]
     rulebook: Optional[Rulebook]
     witness: Optional[Dict[str, object]]
+    used_escalation: bool
 
 
 class AuxData(NamedTuple):
@@ -622,7 +623,8 @@ def learn_rules_via_wl_and_actions(
     """
     if not trains:
         return LearnResult(ok=False, theta=None, rulebook=None,
-                          witness={"reason": "no_training_data"})
+                          witness={"reason": "no_training_data"},
+                          used_escalation=False)
 
     # If no thetas provided, try with theta=None (identity)
     if not thetas:
@@ -640,7 +642,8 @@ def learn_rules_via_wl_and_actions(
     # All thetas failed
     return LearnResult(ok=False, theta=thetas[0] if thetas else None,
                       rulebook=None,
-                      witness={"reason": "all_thetas_failed"})
+                      witness={"reason": "all_thetas_failed"},
+                      used_escalation=False)
 
 
 def learn_for_one_theta(
@@ -688,7 +691,8 @@ def learn_for_one_theta(
                 ok=False,
                 theta=theta,
                 rulebook={},
-                witness={"reason": "dimension_mismatch", "pair_idx": pair_idx}
+                witness={"reason": "dimension_mismatch", "pair_idx": pair_idx},
+                used_escalation=False
             )
 
         for r in range(h):
@@ -774,7 +778,8 @@ def learn_for_one_theta(
                     "class_id": class_id,
                     "reason": "no_action_passes_gates",
                     "sample": sample
-                }
+                },
+                used_escalation=escalated
             )
 
         rulebook[class_id] = rule
@@ -799,11 +804,13 @@ def learn_for_one_theta(
                                 "pos": (r, c),
                                 "expected": Yp[r][c],
                                 "got": composed[r][c]
-                            }
+                            },
+                            used_escalation=escalated
                         )
 
     # Success!
-    return LearnResult(ok=True, theta=theta, rulebook=rulebook, witness=None)
+    return LearnResult(ok=True, theta=theta, rulebook=rulebook, witness=None,
+                      used_escalation=escalated)
 
 
 def learn_for_one_theta_after_escalation(
@@ -840,7 +847,8 @@ def learn_for_one_theta_after_escalation(
                     "class_id": class_id,
                     "reason": "no_action_passes_gates_after_escalation",
                     "sample": sample
-                }
+                },
+                used_escalation=True
             )
 
         rulebook[class_id] = rule
@@ -864,10 +872,12 @@ def learn_for_one_theta_after_escalation(
                                 "pos": (r, c),
                                 "expected": Yp[r][c],
                                 "got": composed[r][c]
-                            }
+                            },
+                            used_escalation=True
                         )
 
-    return LearnResult(ok=True, theta=theta, rulebook=rulebook, witness=None)
+    return LearnResult(ok=True, theta=theta, rulebook=rulebook, witness=None,
+                      used_escalation=True)
 
 
 def try_learn_action_for_class_with_gates(

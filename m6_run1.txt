@@ -1,0 +1,62 @@
+
+======================================================================
+M6 VERIFIER: Full Pipeline with Training Equality
+======================================================================
+
+Configuration:
+  kaggle_path: data
+  max_tasks: 10
+  max_grid_size: 400
+  require_theta: False
+  lut_density_tau: 0.8
+  escalate_policy: None
+
+Loading tasks from data...
+Loaded 10 tasks (skipped large grids >400px)
+
+======================================================================
+PROCESSING TASKS
+======================================================================
+✗ 00576224: UNSAT
+    reason=all_thetas_failed, class=?
+✗ 017c7c7b: UNSAT
+    reason=no_feasible_theta, class=?
+✗ 025d127b: UNSAT
+    reason=all_thetas_failed, class=?
+✗ 03560426: UNSAT
+    reason=all_thetas_failed, class=?
+✗ 0520fde7: UNSAT
+    reason=no_feasible_theta, class=?
+✗ 05269061: UNSAT
+    reason=all_thetas_failed, class=?
+✗ 05f2a901: UNSAT
+    reason=no_feasible_theta, class=?
+✗ 0692e18c: UNSAT
+    reason=all_thetas_failed, class=?
+✗ 08ed6ac7: UNSAT
+    reason=all_thetas_failed, class=?
+✗ 0962bcdd: UNSAT
+    reason=all_thetas_failed, class=?
+
+======================================================================
+SUMMARY
+======================================================================
+Total tasks: 10
+Exact (passed training equality): 0 (0.0%)
+UNSAT: 10
+
+UNSAT Examples:
+  00576224: all_thetas_failed
+  017c7c7b: no_feasible_theta
+  025d127b: all_thetas_failed
+
+======================================================================
+EXIT CRITERIA
+======================================================================
+✓ Verifier ran to completion
+✓ All EXACT tasks passed training equality verification
+✓ All UNSAT tasks have witness
+
+⚠ No tasks solved
+
+======================================================================
