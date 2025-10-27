@@ -1,6 +1,7 @@
 # Data directory
 data/
 reviews/
+runs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

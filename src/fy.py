@@ -27,6 +27,11 @@ from src.phi_wl import wl_refine
 Grid = List[List[int]]
 Mask = List[List[bool]]
 
+# Global debug flag for per-class failure logging
+FY_DEBUG_LOG = False
+FY_DEBUG_TASK_ID = None
+FY_DEBUG_THETA_KIND = None
+
 
 class Rule(NamedTuple):
     """Action specification for a Φ-class."""
@@ -313,10 +318,11 @@ def check_gate_b_non_evidence_safety(
     aux_list: List[AuxData]
 ) -> bool:
     """
-    Gate B: Non-evidence safety.
+    Gate B: Evidence matching AND non-evidence safety.
 
-    For every pair and pixel p in the class mask where Xp[p] == Yp[p],
-    the action must leave p unchanged.
+    For every pair and masked pixel:
+    - If evidence (Xp[p] != Yp[p]): action must produce Yp[p]
+    - If non-evidence (Xp[p] == Yp[p]): action must leave p unchanged
     """
     for pair_idx in range(len(Xp_grids)):
         Xp = Xp_grids[pair_idx]
@@ -336,11 +342,11 @@ def check_gate_b_non_evidence_safety(
         except (ValueError, KeyError):
             return False
 
-        # Check non-evidence pixels unchanged
+        # Check ALL masked pixels
         for r in range(h):
             for c in range(w):
-                if mask[r][c] and Xp[r][c] == Yp[r][c]:
-                    # Non-evidence pixel - must remain unchanged
+                if mask[r][c]:
+                    # BOTH evidence and non-evidence must match Yp
                     if result[r][c] != Yp[r][c]:
                         return False
 
@@ -371,9 +377,9 @@ def check_gate_c_leave_one_out(
         return True
 
     # For non-LUT actions, parameters are fixed (no learning)
-    # Just check if the action matches evidence on ALL pairs
+    # Gate B already verified evidence matching on ALL pairs
+    # So LOO is automatically satisfied (same action applies to all)
     if rule.action not in ["lut_r2", "lut_r3"]:
-        # Already checked in Gate B
         return True
 
     # For LUT: do proper leave-one-out
@@ -605,6 +611,167 @@ def build_lut_from_evidence(
 # Main Learning Function
 # ============================================================================
 
+def print_class_diagnostics(class_id, evidence, Xp_grids, Yp_grids, labels_list, aux_list, lut_density_tau, theta):
+    """Print detailed diagnostics for why a class failed."""
+    if not FY_DEBUG_LOG:
+        return
+
+    # Compute masks for this class (one per pair)
+    masks = []
+    for pair_idx, (Xp, labels) in enumerate(zip(Xp_grids, labels_list)):
+        h, w = dims(Xp)
+        all_masks = class_masks(labels, h, w)
+        mask = all_masks.get(class_id, [[False] * w for _ in range(h)])
+        masks.append(mask)
+
+    mask_size = sum(sum(1 for cell in row if cell) for mask in masks for row in mask)
+    evidence_size = len(evidence)
+
+    print(f"\n=== FY CLASS FAILURE DIAGNOSTIC ===")
+    print(f"class_id: {class_id}")
+    print(f"mask_size: {mask_size}")
+    print(f"evidence_count: {evidence_size}")
+    print(f"theta: {theta.kind if theta else 'identity'}")
+    print(f"\nACTIONS_TRIED:")
+
+    # Get evidence per pair
+    evidence_by_pair = defaultdict(list)
+    for pair_idx, r, c in evidence:
+        evidence_by_pair[pair_idx].append((r, c))
+
+    m = len(Xp_grids)
+
+    # Try mirrors
+    for mirror_kind, mirror_name in [("h", "mirror_h"), ("v", "mirror_v"), ("diag", "mirror_diag")]:
+        # Check totality (Gate A)
+        masks_flat = []
+        for mask in masks:
+            for row in mask:
+                masks_flat.extend(row)
+        totality_ok = all(masks_flat)
+
+        # Check safety (Gate B) - would this break non-evidence pixels?
+        safety_ok = True
+        for i, (Xp, Yp) in enumerate(zip(Xp_grids, Yp_grids)):
+            mask = masks[i]
+            if mirror_kind == "h":
+                edited = mirror_h(Xp, mask)
+            elif mirror_kind == "v":
+                edited = mirror_v(Xp, mask)
+            else:
+                edited = mirror_diag(Xp, mask)
+
+            # Check non-evidence pixels
+            h, w = dims(Xp)
+            for r in range(h):
+                for c in range(w):
+                    if mask[r][c] and (i, r, c) not in [(pi, pr, pc) for pi, pr, pc in evidence]:
+                        # Non-evidence pixel in mask
+                        if Xp[r][c] == Yp[r][c]:  # Should remain unchanged
+                            if edited[r][c] != Yp[r][c]:
+                                safety_ok = False
+                                break
+                if not safety_ok:
+                    break
+            if not safety_ok:
+                break
+
+        # Check LOO (Gate C) if m >= 2
+        loo_ok = True
+        if m >= 2:
+            for leave_out in range(m):
+                # Try learning on all pairs except leave_out
+                train_pairs = [(Xp_grids[i], Yp_grids[i]) for i in range(m) if i != leave_out]
+                # For mirrors, just check if it matches the test pair
+                test_Xp = Xp_grids[leave_out]
+                test_Yp = Yp_grids[leave_out]
+                test_mask = masks[leave_out]
+
+                if mirror_kind == "h":
+                    test_edited = mirror_h(test_Xp, test_mask)
+                elif mirror_kind == "v":
+                    test_edited = mirror_v(test_Xp, test_mask)
+                else:
+                    test_edited = mirror_diag(test_Xp, test_mask)
+
+                # Check if evidence matches
+                for r, c in evidence_by_pair[leave_out]:
+                    if test_edited[r][c] != test_Yp[r][c]:
+                        loo_ok = False
+                        break
+                if not loo_ok:
+                    break
+
+        result = "PASS" if (totality_ok and safety_ok and loo_ok) else "FAIL"
+        print(f"  - {mirror_name}: totality={totality_ok}, safety={safety_ok}, loo={loo_ok} -> {result}")
+
+    # Try shifts
+    print(f"  - shift: (trying dr,dc in [-2,2])")
+    shift_found = False
+    for dr in range(-2, 3):
+        for dc in range(-2, 3):
+            if dr == 0 and dc == 0:
+                continue
+            # Quick check if this shift works
+            works = True
+            for i, (Xp, Yp) in enumerate(zip(Xp_grids, Yp_grids)):
+                mask = masks[i]
+                edited = shift(Xp, mask, dr, dc)
+                # Check evidence
+                for r, c in evidence_by_pair[i]:
+                    if edited[r][c] != Yp[r][c]:
+                        works = False
+                        break
+                if not works:
+                    break
+            if works:
+                print(f"    shift({dr},{dc}): PASS")
+                shift_found = True
+                break
+        if shift_found:
+            break
+    if not shift_found:
+        print(f"    no shift found: FAIL")
+
+    # Try LUT
+    for r in [2, 3]:
+        # Build LUT from evidence
+        lut = {}
+        collisions = 0
+        for i, (Xp, Yp) in enumerate(zip(Xp_grids, Yp_grids)):
+            mask = masks[i]
+            labels = labels_list[i]
+            h, w = dims(Xp)
+
+            for r_pos in range(h):
+                for c_pos in range(w):
+                    if not mask[r_pos][c_pos]:
+                        continue
+
+                    # Extract r×r patch
+                    if r_pos + r > h or c_pos + r > w:
+                        continue
+
+                    patch = tuple(tuple(Xp[r_pos+dr][c_pos+dc] for dc in range(r)) for dr in range(r))
+                    target = Yp[r_pos][c_pos]
+
+                    if patch in lut:
+                        if lut[patch] != target:
+                            collisions += 1
+                    else:
+                        lut[patch] = target
+
+        repetition_ok = len([1 for patch in lut.keys() if sum(1 for i in range(len(Xp_grids)) for r_pos in range(len(Xp_grids[i])) for c_pos in range(len(Xp_grids[i][0])) if masks[i][r_pos][c_pos] and r_pos+r<=len(Xp_grids[i]) and c_pos+r<=len(Xp_grids[i][0]) and tuple(tuple(Xp_grids[i][r_pos+dr][c_pos+dc] for dc in range(r)) for dr in range(r)) == patch) >= 2]) >= 2
+
+        coverage_changed = sum(1 for i in range(len(Xp_grids)) for r_pos, c_pos in evidence_by_pair[i])
+        density = len(lut) / coverage_changed if coverage_changed > 0 else 0
+
+        result = "PASS" if (collisions == 0 and repetition_ok and density <= lut_density_tau) else "FAIL"
+        print(f"  - lut_r{r}: |lut|={len(lut)}, collisions={collisions}, repetition_ok={repetition_ok}, density={density:.2f} -> {result}")
+
+    print(f"===\n")
+
+
 def learn_rules_via_wl_and_actions(
     trains: List[Tuple[Grid, Grid]],
     thetas: List[object],
@@ -646,6 +813,95 @@ def learn_rules_via_wl_and_actions(
                       used_escalation=False)
 
 
+def debug_glue_mismatch(Xp, Yp, labels, rulebook, aux, r, c, failing_class, pair_idx):
+    """
+    Detailed GLUE mismatch diagnostics for checks A, B, C, D.
+    """
+    print(f"\n  === GLUE DEBUG for class {failing_class} at ({r},{c}) ===")
+
+    h, w = dims(Xp)
+    idx = r * w + c
+
+    # A) Mask & labels consistency check
+    print(f"\n  [A] Mask & Labels Consistency:")
+    print(f"    labels[{r},{c}] = {labels[idx]} (should be {failing_class})")
+
+    # Build mask for failing class
+    all_masks = class_masks(labels, h, w)
+    mask = all_masks.get(failing_class, [[False] * w for _ in range(h)])
+    print(f"    mask[{r},{c}] = {mask[r][c]}")
+    print(f"    Xp[{r},{c}] = {Xp[r][c]}")
+    print(f"    Yp[{r},{c}] = {Yp[r][c]}")
+
+    # B) Action safety recheck for this class
+    print(f"\n  [B] Action Safety Recheck for class {failing_class}:")
+    if failing_class in rulebook:
+        rule = rulebook[failing_class]
+        print(f"    Action: {rule.action}")
+        print(f"    Params: {rule.params}")
+
+        # Apply this action only
+        edited = apply_action(Xp, mask, rule, aux)
+
+        # Count violations
+        changed_clean = 0
+        wrong_evidence = 0
+        for rr in range(h):
+            for cc in range(w):
+                if mask[rr][cc]:
+                    if Xp[rr][cc] == Yp[rr][cc]:  # Non-evidence (clean)
+                        if edited[rr][cc] != Xp[rr][cc]:
+                            changed_clean += 1
+                    else:  # Evidence
+                        if edited[rr][cc] != Yp[rr][cc]:
+                            wrong_evidence += 1
+
+        print(f"    changed_clean = {changed_clean} (should be 0)")
+        print(f"    wrong_evidence = {wrong_evidence} (should be 0)")
+        print(f"    edited[{r},{c}] = {edited[r][c]} (vs Yp={Yp[r][c]})")
+    else:
+        print(f"    WARNING: class {failing_class} NOT in rulebook!")
+
+    # C) Incremental GLUE class-by-class
+    print(f"\n  [C] Incremental GLUE (class-by-class):")
+    Z = deepcopy_grid(Xp)
+    first_bad_class = None
+    all_masks = class_masks(labels, h, w)
+
+    for class_id in sorted(rulebook.keys()):
+        rule = rulebook[class_id]
+        mask_k = all_masks.get(class_id, [[False] * w for _ in range(h)])
+
+        # Apply action for this class
+        edited_k = apply_action(Xp, mask_k, rule, aux)
+
+        # Merge into Z
+        for rr in range(h):
+            for cc in range(w):
+                if mask_k[rr][cc]:
+                    Z[rr][cc] = edited_k[rr][cc]
+
+        # Check mismatches after this class
+        mismatches_now = sum(1 for rr in range(h) for cc in range(w) if Z[rr][cc] != Yp[rr][cc])
+
+        if mismatches_now > 0 and first_bad_class is None:
+            first_bad_class = class_id
+            print(f"    First bad class: {class_id} ({rule.action})")
+            print(f"      Mismatches after applying: {mismatches_now}")
+
+            if class_id == failing_class:
+                print(f"      Z[{r},{c}] = {Z[r][c]} (after class {class_id})")
+            break
+
+    if first_bad_class is None:
+        print(f"    No bad class found (all incremental steps matched!)")
+
+    # D) Canon toggle consistency (N/A for now - we're not using task color canon)
+    print(f"\n  [D] Canon Toggle:")
+    print(f"    use_task_color_canon = False (not implemented)")
+    print(f"  === END GLUE DEBUG ===\n")
+
+
 def learn_for_one_theta(
     trains: List[Tuple[Grid, Grid]],
     theta: Optional[object],
@@ -654,6 +910,12 @@ def learn_for_one_theta(
     lut_density_tau: float
 ) -> LearnResult:
     """Learn rulebook for a specific theta."""
+
+    # Debug: announce which theta we're trying
+    if FY_DEBUG_LOG:
+        print(f"\n{'='*70}")
+        print(f"TRYING THETA: {theta.kind if theta else 'identity'}")
+        print(f"{'='*70}")
 
     # Step 1: Canon and apply P
     trains_transformed = []
@@ -687,6 +949,8 @@ def learn_for_one_theta(
 
         # Dimension mismatch - theta produced different sized grids
         if h != h_y or w != w_y:
+            if FY_DEBUG_LOG:
+                print(f"  → DIMENSION_MISMATCH: Xp={h}×{w}, Yp={h_y}×{w_y} at pair {pair_idx}")
             return LearnResult(
                 ok=False,
                 theta=theta,
@@ -701,6 +965,11 @@ def learn_for_one_theta(
                 if Xp[r][c] != Yp[r][c]:
                     class_id = labels[idx]
                     evidence_sets[class_id].append((pair_idx, r, c))
+
+    # Debug: print evidence summary
+    if FY_DEBUG_LOG:
+        total_evidence = sum(len(v) for v in evidence_sets.values())
+        print(f"  → Classes with evidence: {len(evidence_sets)}, Total evidence pixels: {total_evidence}")
 
     # Step 4: Row/col blocks
     aux_list = []
@@ -732,6 +1001,10 @@ def learn_for_one_theta(
         )
 
         if rule is None:
+            # Print diagnostics if debug enabled
+            print_class_diagnostics(class_id, evidence_sets[class_id], Xp_grids, Yp_grids,
+                                   labels_list, aux_list, lut_density_tau, theta)
+
             # No action passed gates - try escalation once per task
             if escalate_policy and not escalated:
                 escalated = True
@@ -785,6 +1058,9 @@ def learn_for_one_theta(
         rulebook[class_id] = rule
 
     # Step 6: Glue check
+    if FY_DEBUG_LOG:
+        print(f"  → Learned rulebook with {len(rulebook)} classes, checking GLUE...")
+
     for i, (Xp, Yp) in enumerate(trains_transformed):
         labels = labels_list[i]
         aux = aux_list[i]
@@ -793,20 +1069,36 @@ def learn_for_one_theta(
         if not same_grid(composed, Yp):
             # Find mismatch
             h, w = dims(Xp)
+            mismatch_count = 0
+            first_mismatch = None
             for r in range(h):
                 for c in range(w):
                     if composed[r][c] != Yp[r][c]:
-                        return LearnResult(
-                            ok=False, theta=theta, rulebook=None,
-                            witness={
-                                "reason": "glue_mismatch",
-                                "pair_idx": i,
-                                "pos": (r, c),
-                                "expected": Yp[r][c],
-                                "got": composed[r][c]
-                            },
-                            used_escalation=escalated
-                        )
+                        mismatch_count += 1
+                        if first_mismatch is None:
+                            idx = r * w + c
+                            class_at_pos = labels[idx]
+                            first_mismatch = (r, c, Yp[r][c], composed[r][c], class_at_pos)
+
+            if FY_DEBUG_LOG and first_mismatch:
+                r, c, expected, got, cls = first_mismatch
+                print(f"  → GLUE_MISMATCH at pair {i}: {mismatch_count} mismatches")
+                print(f"     First at ({r},{c}): expected={expected}, got={got}, class={cls}")
+
+                # Run detailed GLUE diagnostics
+                debug_glue_mismatch(Xp, Yp, labels, rulebook, aux, r, c, cls, i)
+
+            return LearnResult(
+                ok=False, theta=theta, rulebook=None,
+                witness={
+                    "reason": "glue_mismatch",
+                    "pair_idx": i,
+                    "pos": (first_mismatch[0], first_mismatch[1]),
+                    "expected": first_mismatch[2],
+                    "got": first_mismatch[3]
+                },
+                used_escalation=escalated
+            )
 
     # Success!
     return LearnResult(ok=True, theta=theta, rulebook=rulebook, witness=None,
