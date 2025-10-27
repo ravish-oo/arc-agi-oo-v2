@@ -34,14 +34,14 @@ def mirror_h(grid: Grid, mask: Mask) -> Grid:
     if r_max < r_min:  # Empty mask
         return result
 
-    # For each row, flip columns within bbox
+    # For each row, flip columns within bbox (only swap each pair once)
     for r in range(r_min, r_max + 1):
-        for c in range(c_min, c_max + 1):
-            if mask[r][c]:
-                # Mirror column: c -> c_min + (c_max - c)
-                mirror_c = c_min + (c_max - c)
-                if mask[r][mirror_c]:
-                    # Swap values
+        # Only iterate up to midpoint to avoid double-swapping
+        mid_c = (c_min + c_max) // 2
+        for c in range(c_min, mid_c + 1):
+            mirror_c = c_min + (c_max - c)
+            if c != mirror_c:  # Don't swap with self
+                if mask[r][c] and mask[r][mirror_c]:
                     result[r][c], result[r][mirror_c] = result[r][mirror_c], result[r][c]
 
     return result
@@ -62,14 +62,13 @@ def mirror_v(grid: Grid, mask: Mask) -> Grid:
     if r_max < r_min:  # Empty mask
         return result
 
-    # For each column, flip rows within bbox
+    # For each column, flip rows within bbox (only swap each pair once)
+    mid_r = (r_min + r_max) // 2
     for c in range(c_min, c_max + 1):
-        for r in range(r_min, r_max + 1):
-            if mask[r][c]:
-                # Mirror row: r -> r_min + (r_max - r)
-                mirror_r = r_min + (r_max - r)
-                if mask[mirror_r][c]:
-                    # Swap values
+        for r in range(r_min, mid_r + 1):
+            mirror_r = r_min + (r_max - r)
+            if r != mirror_r:  # Don't swap with self
+                if mask[r][c] and mask[mirror_r][c]:
                     result[r][c], result[mirror_r][c] = result[mirror_r][c], result[r][c]
 
     return result
@@ -97,15 +96,15 @@ def mirror_diag(grid: Grid, mask: Mask) -> Grid:
     if bbox_h != bbox_w:
         raise ValueError(f"mirror_diag requires square mask bbox; got {bbox_h}×{bbox_w}")
 
-    # Transpose within bbox
+    # Transpose within bbox (only swap upper triangle to avoid double-swapping)
     for r in range(r_min, r_max + 1):
         for c in range(c_min, c_max + 1):
-            if mask[r][c]:
-                # Map (r, c) -> (r_min + (c - c_min), c_min + (r - r_min))
-                mirror_r = r_min + (c - c_min)
-                mirror_c = c_min + (r - r_min)
-                if mask[mirror_r][mirror_c]:
-                    # Swap values
+            mirror_r = r_min + (c - c_min)
+            mirror_c = c_min + (r - r_min)
+
+            # Only swap if we're in upper triangle (r < mirror_r or r == mirror_r and c < mirror_c)
+            if (r - r_min) < (c - c_min):  # Upper triangle
+                if mask[r][c] and mask[mirror_r][mirror_c]:
                     result[r][c], result[mirror_r][mirror_c] = result[mirror_r][mirror_c], result[r][c]
 
     return result

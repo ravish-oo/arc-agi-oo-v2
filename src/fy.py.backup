@@ -1,0 +1,708 @@
+"""
+FY - Full learning pipeline (M5a + M5b)
+
+M5a: Action Execution Engine (given rulebook, execute it)
+M5b: Learning Driver (learn rulebook from training pairs)
+"""
+
+from typing import List, Dict, Tuple, Optional, Literal, NamedTuple
+from collections import Counter
+from src.utils import dims, deepcopy_grid, validate_colors, same_grid
+from src.actions import local_ofa
+from src.actions.mirror import mirror_h, mirror_v, mirror_diag
+from src.actions.shift import shift
+from src.actions.rowcol import reorder_rows_by_blocks, reorder_cols_by_blocks, sort_rows_lex, sort_cols_lex
+from src.actions.constructors import draw_box_on_components, draw_line_axis_aligned
+from src.actions.lut import lut_rewrite
+from src.actions.constant import set_color
+from src.pi_orient import canon_orient
+from src.p_menu import Theta, apply_theta
+from src.phi_rel import build_rel_structure
+from src.phi_wl import wl_refine
+
+
+Grid = List[List[int]]
+Mask = List[List[bool]]
+
+
+class Rule(NamedTuple):
+    """
+    Action specification for a Φ-class.
+
+    action: name of action to apply
+    params: parameters for that action (e.g., {"dr": 1, "dc": 0} for shift)
+    """
+    action: Literal[
+        "mirror_h", "mirror_v", "mirror_diag",
+        "shift",
+        "reorder_rows_by_blocks", "reorder_cols_by_blocks",
+        "sort_rows_lex", "sort_cols_lex",
+        "draw_box_on_components", "draw_line_axis_aligned",
+        "lut_r2", "lut_r3",
+        "set_color"
+    ]
+    params: Dict[str, object]
+
+
+Rulebook = Dict[int, Rule]  # class_id -> Rule
+
+
+class LearnResult(NamedTuple):
+    """Result of learning attempt."""
+    ok: bool
+    theta: Optional[object]
+    rulebook: Optional[Rulebook]
+    witness: Optional[Dict[str, object]]
+
+
+class AuxData(NamedTuple):
+    """
+    Auxiliary data needed for action application on a single pair.
+
+    row_blocks: list of row index lists (equivalence classes)
+    col_blocks: list of col index lists
+    """
+    row_blocks: List[List[int]]
+    col_blocks: List[List[int]]
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def class_masks(labels: List[int], h: int, w: int) -> Dict[int, Mask]:
+    """
+    Build mask for each Φ-class.
+
+    Args:
+        labels: flat list of class labels (len = h*w, row-major)
+        h, w: grid dimensions
+
+    Returns:
+        Dict mapping class_id -> boolean mask (h×w)
+    """
+    masks = {}
+
+    for k in set(labels):
+        mask = [[False] * w for _ in range(h)]
+        for idx, label in enumerate(labels):
+            if label == k:
+                r = idx // w
+                c = idx % w
+                mask[r][c] = True
+        masks[k] = mask
+
+    return masks
+
+
+def build_row_col_blocks(labels: List[int], h: int, w: int) -> Tuple[List[List[int]], List[List[int]]]:
+    """
+    Build row and column equivalence blocks based on label signatures.
+
+    Rows with identical label signatures are grouped together.
+    Same for columns.
+
+    Returns:
+        (row_blocks, col_blocks) where each is a list of index lists
+    """
+    # Build row signatures
+    row_sigs = {}
+    for r in range(h):
+        sig = tuple(labels[r * w + c] for c in range(w))
+        if sig not in row_sigs:
+            row_sigs[sig] = []
+        row_sigs[sig].append(r)
+
+    row_blocks = [sorted(indices) for indices in row_sigs.values()]
+
+    # Build col signatures
+    col_sigs = {}
+    for c in range(w):
+        sig = tuple(labels[r * w + c] for r in range(h))
+        if sig not in col_sigs:
+            col_sigs[sig] = []
+        col_sigs[sig].append(c)
+
+    col_blocks = [sorted(indices) for indices in col_sigs.values()]
+
+    return row_blocks, col_blocks
+
+
+def build_lut_from_evidence(
+    evidence_pairs: List[Tuple[int, int, int]],  # (pair_idx, r, c)
+    Xp_grids: List[Grid],
+    Yp_grids: List[Grid],
+    labels_list: List[List[int]],
+    class_id: int,
+    r: int
+) -> Optional[Dict[Tuple[Tuple[int, ...], ...], int]]:
+    """
+    Build LUT from training evidence for a specific class and radius.
+
+    Args:
+        evidence_pairs: list of (pair_idx, r, c) tuples for evidence pixels
+        Xp_grids: list of transformed input grids (one per training pair)
+        Yp_grids: list of target grids
+        labels_list: list of label arrays (flat, row-major)
+        class_id: the Φ-class we're building LUT for
+        r: radius (2 or 3)
+
+    Returns:
+        LUT dict mapping canonical patches to colors, or None if collision detected
+    """
+    if r not in {2, 3}:
+        raise ValueError(f"Invalid LUT radius {r}; must be 2 or 3")
+
+    lut = {}
+
+    for pair_idx, row, col in evidence_pairs:
+        Xp = Xp_grids[pair_idx]
+        Yp = Yp_grids[pair_idx]
+        labels = labels_list[pair_idx]
+        h, w = dims(Xp)
+
+        # Extract patch with zero-padding
+        patch = []
+        for dr in range(-r, r + 1):
+            patch_row = []
+            for dc in range(-r, r + 1):
+                pr = row + dr
+                pc = col + dc
+                if 0 <= pr < h and 0 <= pc < w:
+                    patch_row.append(Xp[pr][pc])
+                else:
+                    patch_row.append(0)  # Zero-pad
+            patch.append(patch_row)
+
+        # Apply local OFA
+        key = local_ofa(patch)
+        target_color = Yp[row][col]
+
+        # Check for collision
+        if key in lut:
+            if lut[key] != target_color:
+                # Collision detected
+                return None
+        else:
+            lut[key] = target_color
+
+    return lut
+
+
+def apply_action(
+    grid: Grid,
+    mask: Mask,
+    rule: Rule,
+    aux: AuxData
+) -> Grid:
+    """
+    Apply a single action to a grid within a mask.
+
+    Args:
+        grid: input grid
+        mask: boolean mask (action operates only where mask=True)
+        rule: Rule specifying action and params
+        aux: auxiliary data (row/col blocks)
+
+    Returns:
+        New grid with action applied
+    """
+    action = rule.action
+    params = rule.params
+
+    # Mirrors
+    if action == "mirror_h":
+        return mirror_h(grid, mask)
+    elif action == "mirror_v":
+        return mirror_v(grid, mask)
+    elif action == "mirror_diag":
+        return mirror_diag(grid, mask)
+
+    # Shift
+    elif action == "shift":
+        dr = params["dr"]
+        dc = params["dc"]
+        return shift(grid, mask, dr, dc)
+
+    # Row/col reordering
+    elif action == "reorder_rows_by_blocks":
+        return reorder_rows_by_blocks(grid, mask, aux.row_blocks)
+    elif action == "reorder_cols_by_blocks":
+        return reorder_cols_by_blocks(grid, mask, aux.col_blocks)
+    elif action == "sort_rows_lex":
+        return sort_rows_lex(grid, mask)
+    elif action == "sort_cols_lex":
+        return sort_cols_lex(grid, mask)
+
+    # Constructors
+    elif action == "draw_box_on_components":
+        thickness = params.get("thickness", 1)
+        color = params.get("color", None)
+        return draw_box_on_components(grid, mask, thickness, color)
+    elif action == "draw_line_axis_aligned":
+        axis = params["axis"]
+        color = params["color"]
+        return draw_line_axis_aligned(grid, mask, axis, color)
+
+    # LUT
+    elif action == "lut_r2":
+        lut = params["lut"]
+        return lut_rewrite(grid, mask, r=2, key_to_color=lut)
+    elif action == "lut_r3":
+        lut = params["lut"]
+        return lut_rewrite(grid, mask, r=3, key_to_color=lut)
+
+    # Constant
+    elif action == "set_color":
+        color = params["color"]
+        return set_color(grid, mask, color)
+
+    else:
+        raise ValueError(f"Unknown action: {action}")
+
+
+def glue_once(
+    Xp: Grid,
+    labels: List[int],
+    rulebook: Rulebook,
+    aux: AuxData
+) -> Grid:
+    """
+    Compose all class edits on a grid.
+
+    Per GLUE formula: Ŷ' = X' ⊕ ⊕_k (A_k(X') ⊙ M_k(X'))
+    Each action A_k is applied to the ORIGINAL X', then masked.
+    This ensures each class sees the same input it was trained on.
+
+    Args:
+        Xp: transformed input grid
+        labels: flat label array (row-major)
+        rulebook: mapping from class_id to Rule
+        aux: auxiliary data for actions
+
+    Returns:
+        Composed grid with all edits applied
+    """
+    h, w = dims(Xp)
+    result = deepcopy_grid(Xp)
+
+    # Build masks for all classes
+    masks = class_masks(labels, h, w)
+
+    # Apply each action to ORIGINAL Xp, then copy masked pixels to result
+    for class_id in sorted(rulebook.keys()):
+        if class_id not in masks:
+            # This class doesn't appear in this grid
+            continue
+        rule = rulebook[class_id]
+        mask = masks[class_id]
+
+        # Apply action to ORIGINAL Xp (not accumulated result)
+        edited = apply_action(Xp, mask, rule, aux)
+
+        # Copy masked pixels from edited to result
+        for r in range(h):
+            for c in range(w):
+                if mask[r][c]:
+                    result[r][c] = edited[r][c]
+
+    return result
+
+
+# ============================================================================
+# M5b - Learning Driver
+# ============================================================================
+
+def learn_rules_via_wl_and_actions(
+    trains: List[Tuple[Grid, Grid]],
+    thetas: List[Theta],
+    escalate_policy: Optional[Literal["E8", "2WL"]] = None
+) -> LearnResult:
+    """
+    Learn rulebook from training pairs.
+
+    Try each theta in order. For the first theta where every Φ-class accepts
+    a single action that matches all training evidence exactly, return ok=True.
+
+    Args:
+        trains: raw training pairs (X, Y)
+        thetas: feasible global maps from M2 (in order)
+        escalate_policy: escalation mode (None, "E8", or "2WL")
+
+    Returns:
+        LearnResult with ok=True if exact match found, else ok=False with witness
+    """
+    if not thetas:
+        # No feasible theta
+        return LearnResult(
+            ok=False,
+            theta=None,
+            rulebook=None,
+            witness={"reason": "no_feasible_theta"}
+        )
+
+    # Try each theta
+    for theta in thetas:
+        result = learn_for_one_theta(trains, theta, escalate_policy)
+        if result.ok:
+            return result  # First exact theta wins
+
+    # All thetas failed - return first witness
+    return learn_for_one_theta(trains, thetas[0], escalate_policy)
+
+
+def learn_for_one_theta(
+    trains: List[Tuple[Grid, Grid]],
+    theta: Theta,
+    escalate_policy: Optional[Literal["E8", "2WL"]] = None
+) -> LearnResult:
+    """
+    Try to learn a rulebook for a single theta.
+
+    Returns:
+        LearnResult with ok=True if all classes learned, else witness
+    """
+    # Step 1: Π + P on all training pairs
+    trains_transformed = []
+    for X, Y in trains:
+        Xc = canon_orient(X).grid
+        Yc = canon_orient(Y).grid
+        Xp = apply_theta(Xc, theta)
+        Yp = Yc  # Targets only get Π, not P
+        trains_transformed.append((Xp, Yp))
+
+    # Step 2: Φ on each Xp
+    labels_list = []
+    for Xp, _ in trains_transformed:
+        rel = build_rel_structure(Xp)
+        labels, _, _ = wl_refine(rel, max_iters=20, escalate=None)
+        labels_list.append(labels)
+
+    # Step 3: Gather evidence per class
+    evidence = gather_evidence(trains_transformed, labels_list)
+
+    # Step 4: Build aux data per pair
+    aux_list = []
+    for Xp, _ in trains_transformed:
+        h, w = dims(Xp)
+        idx = len(aux_list)
+        row_blocks, col_blocks = build_row_col_blocks(labels_list[idx], h, w)
+        aux_list.append(AuxData(row_blocks=row_blocks, col_blocks=col_blocks))
+
+    # Step 5: Learn action for each class (two-pass with single escalation)
+    rulebook = {}
+    all_classes = sorted(set(k for k in evidence.keys()))
+
+    # Pass 1: Try learning all classes without escalation
+    failed_classes = []
+    for class_id in all_classes:
+        if class_id not in evidence or not evidence[class_id]:
+            # No evidence for this class - identity/no-op
+            continue
+
+        # Try to learn action
+        rule = try_learn_action_for_class(
+            class_id,
+            evidence[class_id],
+            trains_transformed,
+            labels_list,
+            aux_list
+        )
+
+        if rule is not None:
+            rulebook[class_id] = rule
+        else:
+            failed_classes.append(class_id)
+
+    # Pass 2: If any classes failed, escalate ONCE globally and retry all failed classes
+    if failed_classes and escalate_policy is not None:
+        # Escalate: recompute Φ globally for all pairs
+        labels_list_esc = []
+        for Xp, _ in trains_transformed:
+            rel = build_rel_structure(Xp)
+            labels, _, _ = wl_refine(rel, max_iters=20, escalate=escalate_policy)
+            labels_list_esc.append(labels)
+
+        # Rebuild evidence and aux with escalated labels
+        evidence_esc = gather_evidence(trains_transformed, labels_list_esc)
+        aux_list_esc = []
+        for Xp, _ in trains_transformed:
+            h, w = dims(Xp)
+            idx = len(aux_list_esc)
+            row_blocks, col_blocks = build_row_col_blocks(labels_list_esc[idx], h, w)
+            aux_list_esc.append(AuxData(row_blocks=row_blocks, col_blocks=col_blocks))
+
+        # Retry all failed classes with escalated Φ
+        still_failed = []
+        for class_id in failed_classes:
+            rule = try_learn_action_for_class(
+                class_id,
+                evidence_esc.get(class_id, []),
+                trains_transformed,
+                labels_list_esc,
+                aux_list_esc
+            )
+
+            if rule is not None:
+                rulebook[class_id] = rule
+            else:
+                still_failed.append(class_id)
+
+        # If any classes still failed after escalation, return UNSAT
+        if still_failed:
+            class_id = still_failed[0]  # Report first failure
+            sample = evidence.get(class_id, [(0, 0, 0)])[0] if class_id in evidence else (0, 0, 0)
+            return LearnResult(
+                ok=False,
+                theta=theta,
+                rulebook=None,
+                witness={
+                    "class_id": class_id,
+                    "reason": "no_action_fits_after_escalation",
+                    "sample": sample
+                }
+            )
+
+    elif failed_classes:
+        # Classes failed but no escalation policy - return UNSAT immediately
+        class_id = failed_classes[0]
+        sample = evidence.get(class_id, [(0, 0, 0)])[0] if class_id in evidence else (0, 0, 0)
+        return LearnResult(
+            ok=False,
+            theta=theta,
+            rulebook=None,
+            witness={
+                "class_id": class_id,
+                "reason": "no_action_fits",
+                "sample": sample
+            }
+        )
+
+    # Step 6: Glue sanity check
+    for i, (Xp, Yp) in enumerate(trains_transformed):
+        labels = labels_list[i]
+        aux = aux_list[i]
+        composed = glue_once(Xp, labels, rulebook, aux)
+
+        if not same_grid(composed, Yp):
+            # Composition failed - find first mismatch
+            h, w = dims(Xp)
+            for r in range(h):
+                for c in range(w):
+                    if composed[r][c] != Yp[r][c]:
+                        return LearnResult(
+                            ok=False,
+                            theta=theta,
+                            rulebook=None,
+                            witness={
+                                "reason": "glue_sanity_failed",
+                                "pair_idx": i,
+                                "mismatch_at": (r, c),
+                                "expected": Yp[r][c],
+                                "got": composed[r][c],
+                                "class": labels[r * w + c] if r * w + c < len(labels) else -1
+                            }
+                        )
+            # Shouldn't reach here
+            return LearnResult(
+                ok=False,
+                theta=theta,
+                rulebook=None,
+                witness={
+                    "reason": "glue_sanity_failed",
+                    "pair_idx": i
+                }
+            )
+
+    # Success!
+    return LearnResult(
+        ok=True,
+        theta=theta,
+        rulebook=rulebook,
+        witness=None
+    )
+
+
+def gather_evidence(
+    trains_transformed: List[Tuple[Grid, Grid]],
+    labels_list: List[List[int]]
+) -> Dict[int, List[Tuple[int, int, int]]]:
+    """
+    Gather evidence per class.
+
+    Evidence for class k = list of (pair_idx, r, c) where:
+    - Xp[r][c] != Yp[r][c]
+    - labels[r*w + c] == k
+
+    Returns:
+        Dict mapping class_id -> list of (pair_idx, r, c)
+    """
+    evidence = {}
+
+    for pair_idx, ((Xp, Yp), labels) in enumerate(zip(trains_transformed, labels_list)):
+        h, w = dims(Xp)
+
+        for r in range(h):
+            for c in range(w):
+                if Xp[r][c] != Yp[r][c]:
+                    idx = r * w + c
+                    class_id = labels[idx]
+
+                    if class_id not in evidence:
+                        evidence[class_id] = []
+                    evidence[class_id].append((pair_idx, r, c))
+
+    return evidence
+
+
+def try_learn_action_for_class(
+    class_id: int,
+    evidence_for_class: List[Tuple[int, int, int]],
+    trains_transformed: List[Tuple[Grid, Grid]],
+    labels_list: List[List[int]],
+    aux_list: List[AuxData]
+) -> Optional[Rule]:
+    """
+    Try action menu in order for a specific class.
+
+    Returns first rule that matches all evidence, or None.
+    """
+    if not evidence_for_class:
+        return None
+
+    # Action menu in exact order
+    # 1. Mirrors
+    for action in ["mirror_h", "mirror_v", "mirror_diag"]:
+        rule = Rule(action=action, params={})
+        if check_rule_matches_all_evidence(
+            rule, class_id, evidence_for_class, trains_transformed, labels_list, aux_list
+        ):
+            return rule
+
+    # 2. Shifts
+    for dr in [-2, -1, 0, 1, 2]:
+        for dc in [-2, -1, 0, 1, 2]:
+            if dr == 0 and dc == 0:
+                continue
+            rule = Rule(action="shift", params={"dr": dr, "dc": dc})
+            if check_rule_matches_all_evidence(
+                rule, class_id, evidence_for_class, trains_transformed, labels_list, aux_list
+            ):
+                return rule
+
+    # 3. Row/col reordering
+    for action in ["reorder_rows_by_blocks", "reorder_cols_by_blocks", "sort_rows_lex", "sort_cols_lex"]:
+        rule = Rule(action=action, params={})
+        if check_rule_matches_all_evidence(
+            rule, class_id, evidence_for_class, trains_transformed, labels_list, aux_list
+        ):
+            return rule
+
+    # 4. Constructors
+    for action in ["draw_box_on_components", "draw_line_axis_aligned"]:
+        # Try different params
+        if action == "draw_box_on_components":
+            for thickness in [1, 2]:
+                for color in range(10):
+                    rule = Rule(action=action, params={"thickness": thickness, "color": color})
+                    if check_rule_matches_all_evidence(
+                        rule, class_id, evidence_for_class, trains_transformed, labels_list, aux_list
+                    ):
+                        return rule
+        else:  # draw_line_axis_aligned
+            for axis in ["row", "col"]:
+                for color in range(10):
+                    rule = Rule(action=action, params={"axis": axis, "color": color})
+                    if check_rule_matches_all_evidence(
+                        rule, class_id, evidence_for_class, trains_transformed, labels_list, aux_list
+                    ):
+                        return rule
+
+    # 5. LUT
+    for r in [2, 3]:
+        # Build LUT from evidence
+        Xp_grids = [Xp for Xp, _ in trains_transformed]
+        Yp_grids = [Yp for _, Yp in trains_transformed]
+
+        lut = build_lut_from_evidence(
+            evidence_for_class, Xp_grids, Yp_grids, labels_list, class_id, r
+        )
+
+        if lut is not None:
+            action_name = f"lut_r{r}"
+            rule = Rule(action=action_name, params={"lut": lut})
+            if check_rule_matches_all_evidence(
+                rule, class_id, evidence_for_class, trains_transformed, labels_list, aux_list
+            ):
+                return rule
+
+    # 6. Constant
+    for color in range(10):
+        rule = Rule(action="set_color", params={"color": color})
+        if check_rule_matches_all_evidence(
+            rule, class_id, evidence_for_class, trains_transformed, labels_list, aux_list
+        ):
+            return rule
+
+    return None
+
+
+def check_rule_matches_all_evidence(
+    rule: Rule,
+    class_id: int,
+    evidence_for_class: List[Tuple[int, int, int]],
+    trains_transformed: List[Tuple[Grid, Grid]],
+    labels_list: List[List[int]],
+    aux_list: List[AuxData]
+) -> bool:
+    """
+    Check if a rule matches all evidence for a class.
+
+    Apply rule to each pair's Xp on class mask, check if result matches Yp
+    at ALL masked pixels (not just evidence pixels).
+
+    This ensures:
+    - Evidence pixels (where Xp != Yp): action transforms correctly
+    - Non-evidence pixels (where Xp == Yp): action leaves unchanged
+
+    Critical for constructor actions that write unconditionally to all masked pixels.
+    """
+    # Collect all pairs where this class appears (not just pairs with evidence)
+    pairs_to_check = set()
+    for pair_idx, _, _ in evidence_for_class:
+        pairs_to_check.add(pair_idx)
+
+    # Also check all pairs where this class exists (even without evidence)
+    for pair_idx in range(len(trains_transformed)):
+        labels = labels_list[pair_idx]
+        if class_id in set(labels):
+            pairs_to_check.add(pair_idx)
+
+    # Check each pair
+    for pair_idx in sorted(pairs_to_check):
+        Xp, Yp = trains_transformed[pair_idx]
+        labels = labels_list[pair_idx]
+        aux = aux_list[pair_idx]
+        h, w = dims(Xp)
+
+        # Build mask for this class
+        masks = class_masks(labels, h, w)
+        if class_id not in masks:
+            continue  # Class doesn't appear in this pair
+        mask = masks[class_id]
+
+        # Apply action
+        try:
+            result = apply_action(Xp, mask, rule, aux)
+        except (ValueError, KeyError):
+            # Action failed (e.g., mirror_diag on non-square, invalid params)
+            return False
+
+        # Check ALL masked pixels (not just evidence)
+        for r in range(h):
+            for c in range(w):
+                if mask[r][c]:
+                    if result[r][c] != Yp[r][c]:
+                        return False
+
+    return True

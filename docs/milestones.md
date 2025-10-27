@@ -54,7 +54,7 @@ Include: identity, H/V/180, 90/270 if square, transpose when needed, scale up {2
 
 **Exit when:** all training inputs pass the checks.
 
-## M4 — Actions (library only)
+## M4 — Actions (library only) ✅ COMPLETE
 
 **Implement:** pure functions operating inside a mask.
 
@@ -80,6 +80,24 @@ Keep it small: 1–2 tests per action.
 * Zero unseen-key at train time (LUT coverage must be total on evidence)
 
 **Exit when:** a healthy subset of training tasks produce rulebooks; the rest return UNSAT cleanly.
+
+ M5a - Action Execution Engine
+
+  What: All helpers + action application (no learning)
+  - Data structures (Rule, Rulebook, LearnResult)
+  - class_masks
+  - build_row_col_blocks
+  - build_lut_from_evidence
+  - apply_action (all 13+ actions)
+  - glue_once
+  - Verifier: Given a manually crafted rulebook, verify apply_action + glue_once work correctly
+
+  M5b - Learning Driver
+
+  What: Search/selection logic (uses M5a)
+  - learn_for_one_theta (evidence gathering, menu iteration, escalation)
+  - learn_rules_via_wl_and_actions
+  - Verifier: Full end-to-end on real tasks
 
 ## M6 — GLUE + final training equality
 
